@@ -1,0 +1,42 @@
+version: 0.2
+
+# Requires the following Environment Variables set in either
+#  build project (CodeBuild) or pipeline (CodePipeline):
+#
+# "AWS_ACCOUNT_ID" - The AWS account id (e.g. 123456789012)
+# "AWS_DEFAULT_REGION" - The AWS region (e.g. eu-west-2)
+# "ORGANISATION" - The organisation of docker image (e.g. foobar)
+# "PROJECT_NAME" - The docker image name (e.g. dog-gw, dog-gw-base, etc.)
+# "IMAGE_TAG" - The deployment tag of the docker image (e.g. dev, staging, etc.)
+# "DEPLOY_TAG_PARAM" - The SSM Parameter resource name, where to retrieve the DEPLOY_TAG (e.g. /dog-gw/staging/tag , /dog-gw-base/main/tag , etc.)
+
+phases:
+  pre_build:
+    commands:
+      - echo "Defining image repo props..."
+      - IMAGE_REPO="${ORGANISATION}/${PROJECT_NAME}"
+      - IMAGE_REPO_TAG="${IMAGE_REPO}:${IMAGE_TAG}"
+      - echo "Get deployment git tag from AWS SSM Parameter Store..."
+      - DEPLOY_TAG=$(aws ssm get-parameter --region "${AWS_DEFAULT_REGION}" --name "${DEPLOY_TAG_PARAM}" --with-decryption --output text --query Parameter.Value)
+      - echo "Checkout the ${DEPLOY_TAG} git deployment tag..."
+      - git checkout "${DEPLOY_TAG}"
+      - echo "Logging in to Amazon ECR..."
+      - REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${REPO_URI}"
+      - IMAGE_URI="${REPO_URI}/${IMAGE_REPO_TAG}"
+      - PIP_CONF_SH="pip-conf.sh"
+      - echo "Getting '${PIP_CONF_SH}' script from S3..."
+      - aws s3api get-object --bucket "awsscripts-${AWS_DEFAULT_REGION}" --key "main/pypi/${PIP_CONF_SH}" "${PIP_CONF_SH}"
+      - echo "Running '${PIP_CONF_SH}' script..."
+      - chmod +x "${PIP_CONF_SH}"
+      - eval "./${PIP_CONF_SH} ${AWS_DEFAULT_REGION} pipeline"
+  build:
+    commands:
+      - echo "Build started on $(date)"
+      - echo "Building the ${IMAGE_REPO_TAG} image..."
+      - docker build --no-cache -f Dockerfile -t "${IMAGE_URI}" -t "${REPO_URI}/${IMAGE_REPO}:${IMAGE_TAG}-${DEPLOY_TAG}" --build-arg BASE_IMG_NAME="${REPO_URI}/${ORGANISATION}/${BASE_REPO_NAME}" --build-arg BASE_IMG_TAG="${BASE_REPO_TAG}" --build-arg PIP_CONF_FP="./pip.conf" .
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Pushing the ${IMAGE_REPO_TAG} image to Amazon ECR..."
+      - docker push "${REPO_URI}/${IMAGE_REPO}" --all-tags

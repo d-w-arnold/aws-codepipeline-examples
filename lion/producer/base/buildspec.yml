@@ -1,0 +1,45 @@
+version: 0.2
+
+# Requires the following Environment Variables set in either
+#  build project (CodeBuild) or pipeline (CodePipeline):
+#
+# "AWS_ACCOUNT_ID" - The AWS account id (e.g. 123456789012)
+# "AWS_DEFAULT_REGION" - The AWS region (e.g. eu-west-2)
+# "ORGANISATION" - The organisation of docker image (e.g. foobar)
+# "PROJECT_NAME" - The docker image name (e.g. dog-gw, dog-gw-base, etc.)
+# "IMAGE_TAG" - The deployment tag of the docker image (e.g. dev, staging, etc.)
+
+phases:
+  pre_build:
+    commands:
+      - echo "Defining image repo props..."
+      - IMAGE_REPO="${ORGANISATION}/${PROJECT_NAME}"
+      - IMAGE_REPO_TAG="${IMAGE_REPO}:${IMAGE_TAG}"
+      - echo "Logging in to Amazon ECR (Public)..."
+      - REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+      - IMAGE_URI="${REPO_URI}/${IMAGE_REPO_TAG}"
+  build:
+    commands:
+      - echo "Build started on $(date)"
+      - echo "Building the ${IMAGE_REPO_TAG} image..."
+      - |
+        docker build --no-cache -f base/devtools.Dockerfile -t "${IMAGE_URI}" \
+        --build-arg BASE_IMG_NAME="${BASE_PROJECT_NAME}" \
+        --build-arg BASE_IMG_TAG="${BASE_IMAGE_TAG}" \
+        --build-arg CMAKE_VERSION="${CMAKE_VERSION}" \
+        --build-arg CMAKE_PATCH="${CMAKE_PATCH}" \
+        .
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Logging out of Amazon ECR (Public)..."
+      - docker logout public.ecr.aws
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${REPO_URI}"
+      - echo "Pushing the ${IMAGE_REPO_TAG} image to Amazon ECR..."
+      - docker push "${IMAGE_URI}"
+      - echo "Writing image definitions file..."
+      - printf '[{"imageUri":"%s"}]' "${IMAGE_URI}" > imagedefinitions.json
+artifacts:
+  files: imagedefinitions.json

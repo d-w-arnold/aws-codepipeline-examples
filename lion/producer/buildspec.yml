@@ -1,0 +1,73 @@
+version: 0.2
+
+# Requires the following Environment Variables set in either
+#  build project (CodeBuild) or pipeline (CodePipeline):
+#
+# "AWS_ACCOUNT_ID" - The AWS account id (e.g. 123456789012)
+# "AWS_DEFAULT_REGION" - The AWS region (e.g. eu-west-2)
+# "ORGANISATION" - The organisation of docker image (e.g. foobar)
+# "PROJECT_NAME" - The docker image name (e.g. dog-gw, dog-gw-base, etc.)
+# "IMAGE_TAG" - The deployment tag of the docker image (e.g. dev, staging, etc.)
+# "BASE_PROJECT_NAME" - The docker image name (e.g. dog-gw, dog-gw-base, etc.)
+# "BASE_IMAGE_TAG" - The deployment tag of the docker image (e.g. dev, main, etc.)
+# "SIH_LION_EXTRAS" - Any extra groups to be installed along `sih-lion` core dependencies (e.g. "[collectors,processors]")
+# "SIH_LION_VERSION_META_PARAMETER" - The SSM Parameter resource name, where to retrieve the version meta for `sih-lion`. (e.g. /pypi/sih-lion/version/meta)
+# "LAMBDA_FUNC_SOURCE" - Relative path to the Lambda function source code folder (e.g. "./lion/collector/CollectorCollectLionGlobal")
+# "PRODUCER_UPDATE_FUNCTION" - The name of the Lambda function which will deploy the built container image.
+# "LAMBDA_FUNC_NAMES" - The names of the Lambda functions which need the built container image.
+# "PARAMS_AND_SECRETS_EXT_ARN" - The ARN of the AWS Parameters and Secrets Lambda Extension.
+
+phases:
+  pre_build:
+    commands:
+      - echo "Defining image repo props..."
+      - IMAGE_REPO="${ORGANISATION}/${PROJECT_NAME}"
+      - IMAGE_REPO_TAG="${IMAGE_REPO}:${IMAGE_TAG}"
+      - echo "Logging in to Amazon ECR..."
+      - REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${REPO_URI}"
+      - IMAGE_URI="${REPO_URI}/${IMAGE_REPO_TAG}"
+      - PIP_CONF_SH="pip-conf.sh"
+      - echo "Getting '${PIP_CONF_SH}' script from S3..."
+      - aws s3api get-object --bucket "awsscripts-${AWS_DEFAULT_REGION}" --key "main/pypi/${PIP_CONF_SH}" "${PIP_CONF_SH}"
+      - echo "Running '${PIP_CONF_SH}' script..."
+      - chmod +x "${PIP_CONF_SH}"
+      - eval "./${PIP_CONF_SH} ${AWS_DEFAULT_REGION} pipeline"
+      - echo "Getting Lambda layer '${PARAMS_AND_SECRETS_EXT_ARN}' from S3..."
+      - PARAMS_AND_SECRETS_EXT_ZIP="params_and_secrets_ext.zip"
+      - curl $(aws lambda get-layer-version-by-arn --arn "${PARAMS_AND_SECRETS_EXT_ARN}" --query 'Content.Location' --output text) --output "${PARAMS_AND_SECRETS_EXT_ZIP}"
+      - SIH_LION_VERSION_META=$(aws ssm get-parameter --region "${AWS_DEFAULT_REGION}" --name "${SIH_LION_VERSION_META_PARAMETER}" --with-decryption --output text --query Parameter.Value)
+      - SIH_LION_VERSION="$(echo "${SIH_LION_VERSION_META}" | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(".".join([str(i) for i in [obj["major"], obj["minor"], obj["patch"]]]))')"
+  build:
+    commands:
+      - echo "Build started on $(date)"
+      - echo "Building the ${IMAGE_REPO_TAG} image..."
+      - |
+        docker build --no-cache -f lion/producer.Dockerfile -t "${IMAGE_URI}" \
+        --build-arg BASE_IMG_NAME="${REPO_URI}/${ORGANISATION}/${BASE_PROJECT_NAME}" \
+        --build-arg BASE_IMG_TAG="${BASE_IMAGE_TAG}" \
+        --build-arg PIP_CONF_FIP="./pip.conf" \
+        --build-arg PARAMS_AND_SECRETS_EXT_ZIP="${PARAMS_AND_SECRETS_EXT_ZIP}" \
+        --build-arg SIH_LION_EXTRAS="${SIH_LION_EXTRAS}" \
+        --build-arg SIH_LION_VERSION="${SIH_LION_VERSION}" \
+        --build-arg LAMBDA_FUNC_SOURCE="${LAMBDA_FUNC_SOURCE}" \
+        .
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Pushing the ${IMAGE_REPO_TAG} image to Amazon ECR..."
+      - docker push "${IMAGE_URI}"
+      - |
+        PAYLOAD=$(jq --null-input \
+        --arg imageuri "${IMAGE_URI}" \
+        --arg lambdafuncnames "${LAMBDA_FUNC_NAMES}" \
+        '{"image-uri": $imageuri, "lambda-func-names": $lambdafuncnames}')
+      - printf "Payload:\n%s\n" "${PAYLOAD}"
+      - OUTPUT_TXT="output.txt"
+      - aws lambda invoke --function-name "${PRODUCER_UPDATE_FUNCTION}" --payload "$(echo "${PAYLOAD}" | base64)" "${OUTPUT_TXT}"
+      - OUTPUT=$(cat "${OUTPUT_TXT}")
+      - printf "Lambda function output:\n%s\n" "${OUTPUT}"
+      - echo "Writing image definitions file..."
+      - printf '[{"imageUri":"%s"}]' "${IMAGE_URI}" > imagedefinitions.json
+artifacts:
+  files: imagedefinitions.json

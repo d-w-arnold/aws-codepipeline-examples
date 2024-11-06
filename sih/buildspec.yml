@@ -1,0 +1,68 @@
+version: 0.2
+
+# Requires the following Environment Variables set in either
+#  build project (CodeBuild) or pipeline (CodePipeline):
+#
+# "AWS_ACCOUNT_ID" - The AWS account id (e.g. 123456789012)
+# "AWS_DEFAULT_REGION" - The AWS region (e.g. eu-west-2)
+# "PROJECT_NAME" - The python package name (e.g. sih-lion, etc.)
+# "VERSION_META_FUNCTION" - The name of the Lambda function to use to retrieve version meta.
+# "BITBUCKET_USERNAME" - The Bitbucket username, requiring app password usage.
+# "BITBUCKET_APP_PASSWORD" - The Bitbucket app password.
+# "BITBUCKET_DOMAIN" - The domain name of Bitbucket (e.g. bitbucket.org)
+# "BITBUCKET_WORKSPACE" - The Bitbucket workspace, wherein the repo with the same PROJECT_NAME resides (e.g. foobar-infrastructure-innovation)
+
+env:
+  shell: bash
+
+phases:
+  pre_build:
+    commands:
+      - echo "Installing pip packages..."
+      - pip install build twine
+      - echo "Defining python package props..."
+      - PYPIRC_SH="pypirc.sh"
+      - echo "Getting '${PYPIRC_SH}' script from S3..."
+      - aws s3api get-object --bucket "awsscripts-${AWS_DEFAULT_REGION}" --key "main/pypi/${PYPIRC_SH}" "${PYPIRC_SH}"
+      - echo "Running '${PYPIRC_SH}' script..."
+      - chmod +x "${PYPIRC_SH}"
+      - eval "./${PYPIRC_SH} ${AWS_DEFAULT_REGION} pipeline"
+      - echo "Get version meta, using '${VERSION_META_FUNCTION}' Lambda function..."
+      - COMMIT_ID="$(git rev-parse HEAD)"
+      - COMMIT_MSG="$(echo $(git log --format=%B -n 1 "${COMMIT_ID}"))"
+      - |
+        PAYLOAD=$(jq --null-input \
+        --arg buildno "${CODEBUILD_BUILD_NUMBER}" \
+        --arg commitid "${COMMIT_ID}" \
+        --arg commitmsg "${COMMIT_MSG}" \
+        '{"build-no": $buildno, "commit-id": $commitid, "commit-msg": $commitmsg}')
+      - printf "Payload:\n%s\n" "${PAYLOAD}"
+      - OUTPUT_TXT="output.txt"
+      - aws lambda invoke --function-name "${VERSION_META_FUNCTION}" --payload "$(echo "${PAYLOAD}" | base64)" "${OUTPUT_TXT}"
+      - VERSION_=$(cat "${OUTPUT_TXT}")
+      - printf "Version meta:\n%s\n" "${VERSION_}"
+      - CODE_VERSION="$(cat "${OUTPUT_TXT}" | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(".dev".join([obj["code-version"], obj["build-no"]]) if obj["deploy-env"] == "dev" else obj["code-version"])')"
+      - |
+        GIT_TAG="v${CODE_VERSION}" && \
+        git tag "${GIT_TAG}" && \
+        git push "https://${BITBUCKET_USERNAME}:${BITBUCKET_APP_PASSWORD}@${BITBUCKET_DOMAIN}/${BITBUCKET_WORKSPACE}/${PROJECT_NAME}.git" "${GIT_TAG}" && \
+        echo "Applied git tag: ${GIT_TAG}" || echo "No git tag applied."
+      - VERSION_FILE="./sih/VERSION"
+      - echo "Creating '${VERSION_FILE}' file..."
+      - echo "${CODE_VERSION}" > "${VERSION_FILE}"
+  build:
+    commands:
+      - echo "Build started on $(date)"
+      - echo "Building the ${PROJECT_NAME} package..."
+      - python -m build --wheel
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - DIST_DIR="dist"
+      - WHEEL_EXT=".whl"
+      - echo "Listing '${DIST_DIR}' dir..."
+      - ls -ahl "./${DIST_DIR}"
+      - echo "Getting the built wheel file (${WHEEL_EXT}) in the '${DIST_DIR}' dir for the package..."
+      - WHEEL_FILE="$(ls -AU "./${DIST_DIR}" | grep "${WHEEL_EXT}" | head -1)"
+      - echo "Pushing the '${PROJECT_NAME}' package to the PyPi server..."
+      - twine upload --verbose --config-file "./.pypirc" -r "ProdPI" "./${DIST_DIR}/${WHEEL_FILE}"

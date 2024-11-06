@@ -1,0 +1,109 @@
+version: 0.2
+
+# Requires the following Environment Variables set in either
+#  build project (CodeBuild) or pipeline (CodePipeline):
+#
+# "AWS_ACCOUNT_ID" - The AWS account id (e.g. 123456789012)
+# "AWS_DEFAULT_REGION" - The AWS region (e.g. eu-west-2)
+# "ORGANISATION" - The organisation of docker image (e.g. foobar)
+# "PROJECT_NAME" - The docker image name (e.g. dog-gw, dog-gw-base, etc.)
+# "IMAGE_TAG" - The deployment tag of the docker image (e.g. dev, staging, etc.)
+# "BASE_IMAGE_TAG" - The deployment tag of the docker image (e.g. dev, main, etc.)
+# "CONTAINER_NAME_API" - The ECS container name in your ECS service's task definition that references your docker image, for the API server component
+# "CONTAINER_NAME_BEAT" - The ECS container name in your ECS service's task definition that references your docker image, for the beat component
+# "CONTAINER_NAME_UTIL" - The ECS container name in your ECS service's task definition that references your docker image, for the utility worker component
+# "CONTAINER_NAME_DOS" - The ECS container name in your ECS service's task definition that references your docker image, for the dosimetry worker component
+# "VERSION_META_FUNCTION" - The name of the Lambda function to use to retrieve version meta.
+# "DEPLOY_TAG_PARAM" - The SSM Parameter resource name, where to retrieve the DEPLOY_TAG (e.g. /dog-gw/staging/tag , /dog-gw-base/main/tag , etc.)
+# "BITBUCKET_USERNAME" - The Bitbucket username, requiring app password usage.
+# "BITBUCKET_APP_PASSWORD" - The Bitbucket app password.
+# "BITBUCKET_DOMAIN" - The domain name of Bitbucket (e.g. bitbucket.org)
+# "BITBUCKET_WORKSPACE" - The Bitbucket workspace, wherein the repo with the same PROJECT_NAME resides (e.g. foobar-products-development)
+# "COMP_API" - The API server component (e.g. api)
+# "COMP_BEAT" - The beat component (e.g. beat)
+# "COMP_UTIL" - The utility worker component (e.g. util)
+# "COMP_DOS" - The dosimetry worker component (e.g. dos)
+
+env:
+  shell: bash
+
+phases:
+  pre_build:
+    commands:
+      - echo "Defining image repo props..."
+      - PROJECT_NAME_API="${PROJECT_NAME}-${COMP_API}"
+      - PROJECT_NAME_BEAT="${PROJECT_NAME}-${COMP_BEAT}"
+      - PROJECT_NAME_UTIL="${PROJECT_NAME}-${COMP_UTIL}"
+      - PROJECT_NAME_DOS="${PROJECT_NAME}-${COMP_DOS}"
+      - IMAGE_REPO="${ORGANISATION}/${PROJECT_NAME}"
+      - IMAGE_REPO_API="${ORGANISATION}/${PROJECT_NAME_API}"
+      - IMAGE_REPO_BEAT="${ORGANISATION}/${PROJECT_NAME_BEAT}"
+      - IMAGE_REPO_UTIL="${ORGANISATION}/${PROJECT_NAME_UTIL}"
+      - IMAGE_REPO_DOS="${ORGANISATION}/${PROJECT_NAME_DOS}"
+      - IMAGE_REPO_TAG_API="${IMAGE_REPO_API}:${IMAGE_TAG}"
+      - IMAGE_REPO_TAG_BEAT="${IMAGE_REPO_BEAT}:${IMAGE_TAG}"
+      - IMAGE_REPO_TAG_UTIL="${IMAGE_REPO_UTIL}:${IMAGE_TAG}"
+      - IMAGE_REPO_TAG_DOS="${IMAGE_REPO_DOS}:${IMAGE_TAG}"
+      - echo "Get deployment git tag from AWS SSM Parameter Store..."
+      - DEPLOY_TAG=$(aws ssm get-parameter --region "${AWS_DEFAULT_REGION}" --name "${DEPLOY_TAG_PARAM}" --with-decryption --output text --query Parameter.Value)
+      - echo "Checkout the ${DEPLOY_TAG} git deployment tag..."
+      - git checkout "${DEPLOY_TAG}"
+      - echo "Logging in to Amazon ECR..."
+      - REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${REPO_URI}"
+      - IMAGE_URI_API="${REPO_URI}/${IMAGE_REPO_TAG_API}"
+      - IMAGE_URI_BEAT="${REPO_URI}/${IMAGE_REPO_TAG_BEAT}"
+      - IMAGE_URI_UTIL="${REPO_URI}/${IMAGE_REPO_TAG_UTIL}"
+      - IMAGE_URI_DOS="${REPO_URI}/${IMAGE_REPO_TAG_DOS}"
+      - echo "Get version meta, using '${VERSION_META_FUNCTION}' Lambda function..."
+      - COMMIT_ID="$(git rev-parse HEAD)"
+      - COMMIT_MSG="$(echo $(git log --format=%B -n 1 "${COMMIT_ID}"))"
+      - |
+        PAYLOAD=$(jq --null-input \
+        --arg buildno "${CODEBUILD_BUILD_NUMBER}" \
+        --arg commitid "${COMMIT_ID}" \
+        --arg commitmsg "${COMMIT_MSG}" \
+        '{"build-no": $buildno, "commit-id": $commitid, "commit-msg": $commitmsg}')
+      - printf "Payload:\n%s\n" "${PAYLOAD}"
+      - OUTPUT_TXT="output.txt"
+      - aws lambda invoke --function-name "${VERSION_META_FUNCTION}" --payload "$(echo "${PAYLOAD}" | base64)" "${OUTPUT_TXT}"
+      - VERSION_=$(cat "${OUTPUT_TXT}")
+      - printf "Version meta:\n%s\n" "${VERSION_}"
+      - STAGING="staging"
+      - |
+        [[ "$(jq -r '."deploy-env"' "${OUTPUT_TXT}")" == "${STAGING}" ]] && \
+        GIT_TAG="v$(jq -r '."code-version"' "${OUTPUT_TXT}")" && \
+        git tag "${GIT_TAG}" && \
+        git push "https://${BITBUCKET_USERNAME}:${BITBUCKET_APP_PASSWORD}@${BITBUCKET_DOMAIN}/${BITBUCKET_WORKSPACE}/${PROJECT_NAME}.git" "${GIT_TAG}" && \
+        echo "Applied git tag: ${GIT_TAG}" || echo "No git tag applied."
+  build:
+    commands:
+      - echo "Build started on $(date)"
+      - echo "Building the ${IMAGE_REPO_TAG_API} image..."
+      - docker build --no-cache -f "${COMP_API}/Dockerfile" -t "${IMAGE_URI_API}" -t "${REPO_URI}/${IMAGE_REPO_API}:${IMAGE_TAG}-${DEPLOY_TAG}" --build-arg BASE_IMG_NAME="${REPO_URI}/${IMAGE_REPO}-base" --build-arg BASE_IMG_TAG="${BASE_IMAGE_TAG}" --build-arg VERSION_="${VERSION_}" .
+      - echo "Building the ${IMAGE_REPO_TAG_BEAT} image..."
+      - docker build --no-cache -f "${COMP_BEAT}/Dockerfile" -t "${IMAGE_URI_BEAT}" -t "${REPO_URI}/${IMAGE_REPO_BEAT}:${IMAGE_TAG}-${DEPLOY_TAG}" --build-arg BASE_IMG_NAME="${REPO_URI}/${IMAGE_REPO}-base" --build-arg BASE_IMG_TAG="${BASE_IMAGE_TAG}" --build-arg VERSION_="${VERSION_}" .
+      - echo "Building the ${IMAGE_REPO_TAG_UTIL} image..."
+      - docker build --no-cache -f "${COMP_UTIL}/Dockerfile" -t "${IMAGE_URI_UTIL}" -t "${REPO_URI}/${IMAGE_REPO_UTIL}:${IMAGE_TAG}-${DEPLOY_TAG}" --build-arg BASE_IMG_NAME="${REPO_URI}/${IMAGE_REPO}-base" --build-arg BASE_IMG_TAG="${BASE_IMAGE_TAG}" --build-arg VERSION_="${VERSION_}" .
+      - echo "Building the ${IMAGE_REPO_TAG_DOS} image..."
+      - docker build --no-cache -f "${COMP_DOS}/Dockerfile" -t "${IMAGE_URI_DOS}" -t "${REPO_URI}/${IMAGE_REPO_DOS}:${IMAGE_TAG}-${DEPLOY_TAG}" --build-arg BASE_IMG_NAME="${REPO_URI}/${IMAGE_REPO}-base" --build-arg BASE_IMG_TAG="${BASE_IMAGE_TAG}" --build-arg VERSION_="${VERSION_}" .
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Pushing the ${IMAGE_REPO_TAG_API} image to Amazon ECR..."
+      - docker push "${REPO_URI}/${IMAGE_REPO_API}" --all-tags
+      - echo "Pushing the ${IMAGE_REPO_TAG_BEAT} image to Amazon ECR..."
+      - docker push "${REPO_URI}/${IMAGE_REPO_BEAT}" --all-tags
+      - echo "Pushing the ${IMAGE_REPO_TAG_UTIL} image to Amazon ECR..."
+      - docker push "${REPO_URI}/${IMAGE_REPO_UTIL}" --all-tags
+      - echo "Pushing the ${IMAGE_REPO_TAG_DOS} image to Amazon ECR..."
+      - docker push "${REPO_URI}/${IMAGE_REPO_DOS}" --all-tags
+      - echo "Writing image definitions file..."
+      - |
+        printf '[{"name":"%s","imageUri":"%s"},{"name":"%s","imageUri":"%s"},{"name":"%s","imageUri":"%s"}]' \
+        "${CONTAINER_NAME_API}" "${IMAGE_URI_API}" \
+        "${CONTAINER_NAME_BEAT}" "${IMAGE_URI_BEAT}" \
+        "${CONTAINER_NAME_UTIL}" "${IMAGE_URI_UTIL}" \
+        "${CONTAINER_NAME_DOS}" "${IMAGE_URI_DOS}" > imagedefinitions.json
+artifacts:
+  files: imagedefinitions.json

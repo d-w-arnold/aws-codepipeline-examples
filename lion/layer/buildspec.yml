@@ -1,0 +1,64 @@
+version: 0.2
+
+# Requires the following Environment Variables set in either
+#  build project (CodeBuild) or pipeline (CodePipeline):
+#
+# "AWS_ACCOUNT_ID" - The AWS account id (e.g. 123456789012)
+# "AWS_DEFAULT_REGION" - The AWS region (e.g. eu-west-2)
+# "BUCKET_NAME" - The S3 bucket name, for the built artifact (e.g. sihlion-eu-west-2).
+# "BUCKET_OBJ_KEY" - The S3 object key name, for the built artifact (e.g. layers/msg0deg/py_layer.zip).
+# "LAMBDA_LAYER_FUNCTION" - The name of the Lambda function which creates the Lambda layer.
+# "SIH_LION_EXTRAS" - Any extra groups to be installed along `sih-lion` core dependencies (e.g. "[collectors,processors]")
+# "SIH_LION_VERSION_META_PARAMETER" - The SSM Parameter resource name, where to retrieve the version meta for `sih-lion`. (e.g. /pypi/sih-lion/version/meta)
+
+phases:
+  pre_build:
+    commands:
+      - PIP_CONF_SH="pip-conf.sh"
+      - echo "Getting '${PIP_CONF_SH}' script from S3..."
+      - aws s3api get-object --bucket "awsscripts-${AWS_DEFAULT_REGION}" --key "main/pypi/${PIP_CONF_SH}" "${PIP_CONF_SH}"
+      - echo "Running '${PIP_CONF_SH}' script..."
+      - chmod +x "${PIP_CONF_SH}"
+      - eval "./${PIP_CONF_SH} ${AWS_DEFAULT_REGION} pipeline"
+      - echo "Setting variables..."
+      - PWD=$(pwd)
+      - export PIP_CONFIG_FILE="${PWD}/pip.conf"
+      - PYTHON="python3.9"
+      - echo "Update the apt package index and install ${PYTHON}..."
+      - apt-get update -y
+      - apt-get install -y software-properties-common
+      - add-apt-repository ppa:deadsnakes/ppa
+      - apt-get install -y ${PYTHON}-venv
+      - VENV_PACKAGES_DIR="./venv"
+      - ZIP_PACKAGES_DIR="./python"
+      - PATH_PACKAGES="lib/"${PYTHON}"/site-packages"
+      - PATH_VENV_PACKAGES="${VENV_PACKAGES_DIR}/${PATH_PACKAGES}"
+      - PATH_ZIP="./py_layer.zip"
+      - PATH_ZIP_PACKAGES="${ZIP_PACKAGES_DIR}/${PATH_PACKAGES}"
+      - echo "Creating Python virtual environment..."
+      - eval "${PYTHON} -m venv ${VENV_PACKAGES_DIR}"
+      - . "${VENV_PACKAGES_DIR}/bin/activate"
+      - echo "Upgrading pip..."
+      - eval "${PYTHON} -m pip install --upgrade pip"
+      - SIH_LION_VERSION_META=$(aws ssm get-parameter --region "${AWS_DEFAULT_REGION}" --name "${SIH_LION_VERSION_META_PARAMETER}" --with-decryption --output text --query Parameter.Value)
+      - SIH_LION_VERSION="$(echo "${SIH_LION_VERSION_META}" | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(".".join([str(i) for i in [obj["major"], obj["minor"], obj["patch"]]]))')"
+  build:
+    commands:
+      - echo "Build started on $(date)"
+      - echo "Downloading Python package from the PyPi server..."
+      - eval "${PYTHON} -m pip install --no-cache-dir --upgrade \"sih-lion${SIH_LION_EXTRAS}~=${SIH_LION_VERSION}\""
+      - echo "Building layer code into a .zip file archive..."
+      - mkdir -p "${PATH_ZIP_PACKAGES}"
+      - eval "cp -av ${PATH_VENV_PACKAGES}/* ${PATH_ZIP_PACKAGES}"
+      - rm -rf ${PATH_ZIP_PACKAGES}/boto*
+      - zip -r "${PATH_ZIP}" "${ZIP_PACKAGES_DIR}"
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Putting '${PATH_ZIP}' file archive on S3..."
+      - aws s3api put-object --bucket "${BUCKET_NAME}" --key "${BUCKET_OBJ_KEY}" --body "${PATH_ZIP}"
+      - echo "Creating Lambda layer, using '${LAMBDA_LAYER_FUNCTION}' Lambda function..."
+      - OUTPUT_TXT="output.txt"
+      - aws lambda invoke --function-name "${LAMBDA_LAYER_FUNCTION}" "${OUTPUT_TXT}"
+      - OUTPUT=$(cat "${OUTPUT_TXT}")
+      - printf "Lambda function output:\n%s\n" "${OUTPUT}"
